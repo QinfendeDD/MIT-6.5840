@@ -1,10 +1,16 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io/ioutil"
 	"log"
 	"net/rpc"
+	"os"
+	"sort"
+	"strconv"
+	"time"
 )
 
 // KeyValue
@@ -35,6 +41,25 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
+	for {
+		task := Task{}
+		if !GetTask(&task) {
+			break // Exit the loop if getting a task fails
+		}
+
+		switch task.Type {
+		case TaskTypeWaiting:
+			time.Sleep(time.Second) // Wait before fetching the next task
+		case TaskTypeRequestMap:
+			DoMapAction(mapf, &task)
+			TaskFinish(&task)
+		case TaskTypeRequestReduce:
+			DoReduceAction(reducef, &task)
+			TaskFinish(&task)
+		default:
+			return
+		}
+	}
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
@@ -68,6 +93,122 @@ func CallExample() {
 	} else {
 		fmt.Printf("call failed!\n")
 	}
+}
+
+// DoMapAction do map action
+// 1. read input from stdin
+// 2. do mapf()
+// 3. output flies to stdout
+// 4. send task finish to coordinator
+func DoMapAction(mapf func(string, string) []KeyValue, task *Task) {
+	var kvs []KeyValue
+	kvsMap := make([][]KeyValue, task.NReduce)
+
+	file, err := os.Open(task.ToBeOperatedFileName)
+	if err != nil {
+		log.Fatalf("could not open file:%v err:%v", task.ToBeOperatedFileName, err)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("could not read file:%v err:%v", task.ToBeOperatedFileName, err)
+	}
+	if err := file.Close(); err != nil {
+		log.Fatalf("could not close file:%v err:%v", task.ToBeOperatedFileName, err)
+	}
+	kva := mapf(task.ToBeOperatedFileName, string(content))
+	kvs = append(kvs, kva...)
+
+	for _, kv := range kvs {
+		index := ihash(kv.Key) % task.NReduce
+		kvsMap[index] = append(kvsMap[index], kv)
+	}
+
+	sort.Sort(ByKey(kvs))
+	for i := 0; i < task.NReduce; i++ {
+		outputFileName := "mr-" + strconv.Itoa(task.TaskID) + "-" + strconv.Itoa(i)
+		outputFile, _ := os.Create(outputFileName)
+		enc := json.NewEncoder(outputFile)
+		for _, kv := range kvsMap[i] {
+			enc.Encode(&kv)
+		}
+		outputFile.Close()
+	}
+}
+
+// DoReduceAction do reduce action
+// 1. read input from stdin
+// 2. sort by key
+// 3. do reducef()
+// 4. output flies to stdout
+// 5. send task finish to coordinator
+func DoReduceAction(reducef func(string, []string) string, task *Task) {
+	var kvs []KeyValue
+
+	for i := 0; i < task.NReduce; i++ {
+		filepath := task.ToBeOperatedFileName + strconv.Itoa(i) + "-" + strconv.Itoa(task.TaskID)
+		file, _ := os.Open(filepath)
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			err := dec.Decode(&kv)
+			if err != nil {
+				break
+			}
+			kvs = append(kvs, kv)
+		}
+		if err := file.Close(); err != nil {
+			log.Fatalf("could not close file:%v err:%v", filepath, err)
+		}
+	}
+
+	sort.Sort(ByKey(kvs))
+	outputFileName := "mr-out-" + strconv.Itoa(task.TaskID)
+	outputFile, err := os.Create(outputFileName)
+	if err != nil {
+		log.Fatalf("Failed to create output file '%s': %v", outputFileName, err)
+	}
+	defer outputFile.Close()
+
+	start := 0
+	for start < len(kvs) {
+		end := start + 1
+		// find all values with the same key
+		for end < len(kvs) && kvs[end].Key == kvs[start].Key {
+			end++
+		}
+
+		// according to the start and end indexes, collect all values
+		values := make([]string, end-start)
+		for idx := start; idx < end; idx++ {
+			values[idx-start] = kvs[idx].Value
+		}
+
+		// apply reduce function and output result
+		aggregatedOutput := reducef(kvs[start].Key, values)
+		if _, err := fmt.Fprintf(outputFile, "%v %v\n", kvs[start].Key, aggregatedOutput); err != nil {
+			log.Fatalf("Failed to write to output file: %v", err)
+		}
+
+		// move to the next different key
+		start = end
+	}
+}
+
+// TaskFinish task finish
+func TaskFinish(task *Task) {
+	res := ExampleReply{}
+	// call task finish
+	call("Coordinator.TaskDone", task, &res)
+}
+
+func GetTask(reply *Task) bool {
+	args := ExampleArgs{}
+
+	if reply.Type == TaskTypeWaiting {
+		args.X = TaskTypeWaiting.Type2Int()
+	}
+
+	return call("Coordinator.DoTask", &ExampleArgs{}, reply)
 }
 
 //
